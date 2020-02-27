@@ -23,6 +23,10 @@ load(
     "AppleFrameworkImportInfo",
 )
 load(
+    "@build_bazel_rules_apple//apple/internal:codesigning_support.bzl",
+    "codesigning_support",
+)
+load(
     "@build_bazel_rules_apple//apple/internal:processor.bzl",
     "processor",
 )
@@ -71,49 +75,129 @@ def _framework_import_partial_impl(ctx, targets, targets_to_avoid, extra_binarie
             # bundled.
             files_to_bundle = [x for x in files_to_bundle if x not in avoid_files]
 
-    bundle_files = []
-    slicer_args = []
-    main_binary = outputs.binary(ctx)
+    bundle_zips = []
+    signed_frameworks_list = []
+
+    # Use the slices produced from the main binary and extra_binaries to determine what slices we
+    # need.
+    all_binaries = extra_binaries + [outputs.binary(ctx)]
+
+    # Separating our files by framework path, to better address what should be passed in.
+    framework_binaries_by_framework = dict()
+    files_by_framework = dict()
     for file in files_to_bundle:
         framework_path = bundle_paths.farthest_parent(file.short_path, "framework")
+        if not files_by_framework.get(framework_path):
+            files_by_framework[framework_path] = []
+        if not framework_binaries_by_framework.get(framework_path):
+            framework_binaries_by_framework[framework_path] = []
+
+        # Check if this file is a binary to slice and code sign.
         framework_relative_path = paths.relativize(file.short_path, framework_path)
+        parent_dir = paths.basename(framework_path)
+        framework_relative_dir = paths.dirname(framework_relative_path).strip("/")
+        if framework_relative_dir:
+            parent_dir = paths.join(parent_dir, framework_relative_dir)
+
+        # Check if this is a macOS path. Format informally described by
+        # http://www.synack.net/~bbraun/writing/frameworks.txt . Searching for:
+        # ...(framework name).framework/Versions/(version number)/(framework name)
+        framework_split_path = framework_relative_path.split("/")
+
+        if len(framework_split_path) > 3:
+            if (framework_split_path[-3] == "Versions" and
+                paths.replace_extension(framework_split_path[-4], "") == file.basename):
+                framework_binaries_by_framework[framework_path].append(file)
+                continue
+
+        # Check if this is an iOS/tvOS/watchOS path.
+        if paths.replace_extension(parent_dir, "") == file.basename:
+            framework_binaries_by_framework[framework_path].append(file)
+            continue
+
+        files_by_framework[framework_path].append(file)
+
+    for framework_path in files_by_framework.keys():
+        framework_binaries = framework_binaries_by_framework[framework_path]
+        framework_relative_path = paths.relativize(framework_binaries[0].short_path, framework_path)
 
         parent_dir = paths.basename(framework_path)
         framework_relative_dir = paths.dirname(framework_relative_path).strip("/")
         if framework_relative_dir:
             parent_dir = paths.join(parent_dir, framework_relative_dir)
 
-        # check to see if the the parent is "Foo.[extension]" and the file is "Foo", thus "Foo.framework/Foo", so the binary within the framework.
-        if paths.replace_extension(parent_dir, "") == file.basename:
-            stripped = intermediates.file(
-                ctx.actions,
-                ctx.label.name,
-                paths.join("_imported_frameworks", file.basename),
-            )
-            bundle_files.append(
-                (processor.location.framework, parent_dir, depset([stripped])),
-            )
+        temp_path = paths.join("_imported_frameworks/", parent_dir)
 
-            args = slicer_args + ["--in", file.path, "--out", stripped.path]
-            all_binaries = extra_binaries + [main_binary]
-            for binary in all_binaries:
-                args.append(binary.path)
+        temp_framework_bundle = intermediates.directory(
+            ctx.actions,
+            ctx.label.name,
+            temp_path,
+        )
 
-            apple_support.run(
-                ctx,
-                inputs = [file] + all_binaries,
-                tools = [ctx.executable._realpath],
-                executable = ctx.executable._dynamic_framework_slicer,
-                outputs = [stripped],
-                arguments = args,
-                mnemonic = "DynamicFrameworkSlicer",
-            )
-        else:
-            bundle_files.append(
-                (processor.location.framework, parent_dir, depset([file])),
-            )
+        framework_zip = intermediates.file(
+            ctx.actions,
+            ctx.label.name,
+            temp_path + ".zip",
+        )
 
-    return struct(bundle_files = bundle_files)
+        args = []
+
+        for framework_binary in framework_binaries:
+            args.append("--framework_binary")
+            args.append(framework_binary.path)
+
+        for binary in all_binaries:
+            args.append("--binary")
+            args.append(binary.path)
+
+        args.append("--output_zip")
+        args.append(framework_zip.path)
+
+        args.append("--temp_path")
+        args.append(temp_framework_bundle.path)
+
+        for file in files_by_framework[framework_path]:
+            args.append("--framework_file")
+            args.append(file.path)
+
+        codesign_args = codesigning_support.codesigning_args(
+            ctx,
+            entitlements = None,
+            full_archive_path = temp_framework_bundle.path,
+            is_framework = True,
+        )
+        args.extend(codesign_args)
+
+        # Inputs of action are all the framework files, plus any of the imports needed to do
+        # framework slicing, plus any of the inputs needed to do signing.
+        apple_support.run(
+            ctx,
+            inputs = files_by_framework[framework_path] + framework_binaries_by_framework[framework_path] + all_binaries,
+            tools = [ctx.executable._codesigningtool],
+            executable = ctx.executable._dynamic_framework_slicer,
+            outputs = [temp_framework_bundle, framework_zip],
+            arguments = args,
+            mnemonic = "DynamicFrameworkSlicerWithCodesigningAndZipping",
+        )
+
+        bundle_zips.append(
+            (processor.location.framework, None, depset([framework_zip])),
+        )
+        signed_frameworks_list.append(parent_dir)
+
+    # TODO(nglevin): When testing, check if we have test coverage of the dynamic fmwk import
+    # code paths in the apple_rules today, and if we need to create a special dynamic fmwk
+    # that can be imported for testing. Might be an objc_library that gets copied into a
+    # .framework folder with an Info.plist and other bits so that we don't have to recompile the
+    # test framework for future architecture (binary slice) changes on Apple platforms.
+
+    # TODO(nglevin): Might have to make one or both of these recursive, if there are any
+    # frameworks-in-frameworks cases that the partials have to handle (unsure, haven't confirmed
+    # with Tony or Thomas yet).
+    return struct(
+        bundle_zips = bundle_zips,
+        signed_frameworks = depset(signed_frameworks_list),
+    )
 
 def framework_import_partial(targets, targets_to_avoid = [], extra_binaries = []):
     """Constructor for the framework import file processing partial.

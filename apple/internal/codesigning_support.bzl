@@ -54,11 +54,12 @@ def _double_quote(raw_string):
     """
     return "\"" + raw_string.replace("\"", "\\\"") + "\""
 
-def _codesign_command_for_path(
+def _codesign_args_for_path(
         ctx,
         path_to_sign,
         provisioning_profile,
-        entitlements_file):
+        entitlements_file,
+        shell_quote = True):
     """Returns a single `codesign` command invocation.
 
     Args:
@@ -68,9 +69,10 @@ def _codesign_command_for_path(
       provisioning_profile: The provisioning profile file. May be `None`.
       entitlements_file: The entitlements file to pass to codesign. May be `None`
           for non-app binaries (e.g. test bundles).
+      shell_quote: Sanitizes the arguments to be evaluated in a shell.
 
     Returns:
-      The codesign command invocation for the given directory.
+      The codesign command invocation for the given directory as a list.
     """
     if not path_to_sign.is_directory and path_to_sign.signed_frameworks:
         fail("Internal Error: Received a list of signed frameworks as exceptions " +
@@ -82,7 +84,6 @@ def _codesign_command_for_path(
                  "to sign (%s) as its prefix (%s)." % (path_to_sign.path, x))
 
     cmd_codesigning = [
-        ctx.executable._codesigningtool.path,
         "--codesign",
         "/usr/bin/codesign",
     ]
@@ -94,55 +95,60 @@ def _codesign_command_for_path(
     identity = ctx.fragments.objc.signing_certificate_name if is_device else "-"
     if not identity:
         if provisioning_profile:
-            cmd_codesigning.extend([
-                "--mobileprovision",
-                shell.quote(provisioning_profile.path),
-            ])
+            cmd_codesigning.append("--mobileprovision")
+            if shell_quote:
+                cmd_codesigning.append(shell.quote(provisioning_profile.path))
+            else:
+                cmd_codesigning.append(provisioning_profile.path)
         else:
             identity = "-"
 
     if identity:
-        cmd_codesigning.extend(["--identity", shell.quote(identity)])
+        cmd_codesigning.append("--identity")
+        if shell_quote:
+            cmd_codesigning.append(shell.quote(identity))
+        else:
+            cmd_codesigning.append(identity)
 
     if is_device:
         if path_to_sign.use_entitlements and entitlements_file:
-            cmd_codesigning.extend([
-                "--entitlements",
-                shell.quote(entitlements_file.path),
-            ])
-        cmd_codesigning.extend([
-            "--force",
-        ])
+            cmd_codesigning.append("--entitlements")
+            if shell_quote:
+                cmd_codesigning.append(shell.quote(entitlements_file.path))
+            else:
+                cmd_codesigning.append(entitlements_file.path)
+        cmd_codesigning.append("--force")
     else:
         cmd_codesigning.extend([
             "--force",
-            "--timestamp=none",
+            "--disable_timestamp",
         ])
-
-    # Because the path does include environment variables which need to be expanded, path has to be
-    # quoted using double quotes, this means that path can't be quoted using shell.quote.
-    cmd_codesigning.extend([
-        "--full_path_to_sign",
-        _double_quote(path_to_sign.path),
-    ])
 
     if path_to_sign.is_directory:
-        cmd_codesigning.extend([
-            "--is_directory",
-        ])
+        cmd_codesigning.append("--directory_to_sign")
+    else:
+        cmd_codesigning.append("--target_to_sign")
+    if shell_quote:
+        # Because the path does include environment variables which need to be expanded, path has
+        # to be quoted using double quotes, this means that path can't be quoted using shell.quote.
+        cmd_codesigning.append(_double_quote(path_to_sign.path))
+    else:
+        cmd_codesigning.append(path_to_sign.path)
 
     if path_to_sign.signed_frameworks:
-        # Signed frameworks must also be double quoted, as they too have an environment variable to
-        # be expanded.
-        cmd_codesigning.append("--signed_frameworks")
-        cmd_codesigning.extend([_double_quote(p) for p in path_to_sign.signed_frameworks])
-
-    final_command = " ".join(cmd_codesigning)
+        for signed_framework in path_to_sign.signed_frameworks:
+            cmd_codesigning.append("--signed_path")
+            if shell_quote:
+                # Signed frameworks must also be double quoted, as they too have an environment
+                # variable to be expanded.
+                cmd_codesigning.append(_double_quote(signed_framework))
+            else:
+                cmd_codesigning.append(signed_framework)
 
     # The command returned by this function is executed as part of the final bundling shell script.
     # Each directory to be signed must be prefixed by $WORK_DIR, which is the variable in that
     # script that contains the path to the directory where the bundle is being built.
-    return final_command
+    return cmd_codesigning
 
 def _path_to_sign(path, is_directory = False, signed_frameworks = [], use_entitlements = True):
     """Returns a "path to sign" value to be passed to `_signing_command_lines`.
@@ -171,6 +177,20 @@ def _path_to_sign(path, is_directory = False, signed_frameworks = [], use_entitl
         use_entitlements = use_entitlements,
     )
 
+def _provisioning_profile(ctx):
+    # Verify that a provisioning profile was provided for device builds on
+    # platforms that require it.
+    is_device = platform_support.is_device_build(ctx)
+    provisioning_profile = getattr(ctx.file, "provisioning_profile", None)
+    rule_descriptor = rule_support.rule_descriptor(ctx)
+    if (is_device and
+        rule_descriptor.requires_signing_for_device and
+        not provisioning_profile):
+        fail("The provisioning_profile attribute must be set for device " +
+             "builds on this platform (%s)." %
+             platform_support.platform_type(ctx))
+    return provisioning_profile
+
 def _signing_command_lines(
         ctx,
         paths_to_sign,
@@ -190,39 +210,22 @@ def _signing_command_lines(
     Returns:
       A multi-line string with codesign invocations for the bundle.
     """
+    provisioning_profile = _provisioning_profile(ctx)
+
     commands = []
 
-    # Verify that a provisioning profile was provided for device builds on
-    # platforms that require it.
-    is_device = platform_support.is_device_build(ctx)
-    provisioning_profile = getattr(ctx.file, "provisioning_profile", None)
-    rule_descriptor = rule_support.rule_descriptor(ctx)
-    if (is_device and
-        rule_descriptor.requires_signing_for_device and
-        not provisioning_profile):
-        fail("The provisioning_profile attribute must be set for device " +
-             "builds on this platform (%s)." %
-             platform_support.platform_type(ctx))
-
-    # Just like Xcode, ensure CODESIGN_ALLOCATE is set to point to the correct
-    # version. DEVELOPER_DIR will already be set on the action that invokes
-    # the script. Without this, codesign should already be using DEVELOPER_DIR
-    # to find things, but this should get the rules slightly closer on behaviors.
-    # apple_common.apple_toolchain().developer_dir() won't work here because
-    # usage relies on the expansion done in the xcrunwrapper, and the individual
-    # signing commands don't bounce through xcrun (and don't need to).
-    commands.append(
-        ("export CODESIGN_ALLOCATE=${DEVELOPER_DIR}/" +
-         "Toolchains/XcodeDefault.xctoolchain/usr/bin/codesign_allocate"),
-    )
-
+    # Use of the entitlements file is not recommended for the signing of frameworks. As long as
+    # this remains the case, we do have to split the "paths to sign" between multiple invocations
+    # of codesign.
     for path_to_sign in paths_to_sign:
-        commands.append(_codesign_command_for_path(
+        codesign_command = [ctx.executable._codesigningtool.path]
+        codesign_command.extend(_codesign_args_for_path(
             ctx,
             path_to_sign,
             provisioning_profile,
             entitlements_file,
         ))
+        commands.append(" ".join(codesign_command))
     return "\n".join(commands)
 
 def _should_sign_simulator_bundles(ctx):
@@ -249,28 +252,15 @@ def _should_sign_simulator_bundles(ctx):
         True,
     )
 
-def _codesigning_command(ctx, entitlements, frameworks_path, signed_frameworks, bundle_path = ""):
-    """Returns a codesigning command that includes framework embedded bundles.
-
-    Args:
-        ctx: The rule context.
-        entitlements: The entitlements file to sign with. Can be None.
-        frameworks_path: The location of the Frameworks directory, relative to the archive.
-        signed_frameworks: A depset containing each framework that has already been signed.
-        bundle_path: The location of the bundle, relative to the archive.
-
-    Returns:
-        A string containing the codesigning commands.
-    """
-    rule_descriptor = rule_support.rule_descriptor(ctx)
-    signing_command_lines = ""
-    codesigning_exceptions = rule_descriptor.codesigning_exceptions
+def _should_sign_bundles(ctx):
     should_sign_bundles = True
 
+    rule_descriptor = rule_support.rule_descriptor(ctx)
+    codesigning_exceptions = rule_descriptor.codesigning_exceptions
     if (codesigning_exceptions ==
         rule_support.codesigning_exceptions.sign_with_provisioning_profile):
         # If the rule doesn't have a provisioning profile, do not sign the binary or its
-        # frameworks. In that case, we return an empty string.
+        # frameworks.
         provisioning_profile = getattr(ctx.file, "provisioning_profile", None)
         if not provisioning_profile:
             should_sign_bundles = False
@@ -279,7 +269,60 @@ def _codesigning_command(ctx, entitlements, frameworks_path, signed_frameworks, 
     elif codesigning_exceptions != rule_support.codesigning_exceptions.none:
         fail("Internal Error: Encountered unsupported state for codesigning_exceptions.")
 
-    if should_sign_bundles:
+    return should_sign_bundles
+
+def _codesigning_args(
+        ctx,
+        entitlements,
+        full_archive_path = "",
+        is_framework = False):
+    """Returns a set of codesigning arguments to be passed to the codesigning tool.
+
+    Args:
+        ctx: The rule context.
+        entitlements: The entitlements file to sign with. Can be None.
+        full_archive_path: The full path to the codesigning target.
+        is_framework: If the target is a framework. False by default.
+
+    Returns:
+        A list containing the arguments to pass to the codesigning tool.
+    """
+    signing_args = []
+
+    if _should_sign_bundles(ctx):
+        is_device = platform_support.is_device_build(ctx)
+        if is_framework or is_device or _should_sign_simulator_bundles(ctx):
+            signing_args = _codesign_args_for_path(
+                ctx,
+                _path_to_sign(full_archive_path),
+                provisioning_profile = _provisioning_profile(ctx),
+                entitlements_file = entitlements,
+                shell_quote = False,
+            )
+
+    return signing_args
+
+def _codesigning_command(
+        ctx,
+        entitlements,
+        frameworks_path,
+        signed_frameworks,
+        bundle_path = ""):
+    """Returns a codesigning command that includes framework embedded bundles.
+
+    Args:
+        ctx: The rule context.
+        entitlements: The entitlements file to sign with. Can be None.
+        frameworks_path: The location of the Frameworks directory, relative to the archive.
+        signed_frameworks: A depset containingf each framework that has already been signed.
+        bundle_path: The location of the bundle, relative to the archive.
+
+    Returns:
+        A string containing the codesigning commands.
+    """
+    signing_command_lines = ""
+
+    if _should_sign_bundles(ctx):
         paths_to_sign = []
 
         if frameworks_path:
@@ -300,13 +343,14 @@ def _codesigning_command(ctx, entitlements, frameworks_path, signed_frameworks, 
 
         is_device = platform_support.is_device_build(ctx)
         if is_device or _should_sign_simulator_bundles(ctx):
+            path_to_sign = paths.join("$WORK_DIR", bundle_path)
             paths_to_sign.append(
-                _path_to_sign(paths.join("$WORK_DIR", bundle_path)),
+                _path_to_sign(path_to_sign),
             )
         signing_command_lines = _signing_command_lines(
             ctx,
-            paths_to_sign,
-            entitlements,
+            paths_to_sign = paths_to_sign,
+            entitlements_file = entitlements,
         )
 
     return signing_command_lines
@@ -447,6 +491,7 @@ def _sign_binary_action(ctx, input_binary, output_binary):
     )
 
 codesigning_support = struct(
+    codesigning_args = _codesigning_args,
     codesigning_command = _codesigning_command,
     post_process_and_sign_archive_action = _post_process_and_sign_archive_action,
     sign_binary_action = _sign_binary_action,

@@ -76,6 +76,10 @@ def _macos_application_impl(ctx):
     bundle_id = ctx.attr.bundle_id
     embedded_targets = ctx.attr.extensions + ctx.attr.xpc_services
 
+    # TODO(nglevin): thomasvl@ has hinted that the handling of frameworks is different between
+    # macOS and iOS/tvOS. Make sure we have good test coverage for this specific case and that the
+    # tests are updated to handle the slight differences between macos_application and the other
+    # *_application equivalents.
     processor_partials = [
         partials.apple_bundle_info_partial(bundle_id = bundle_id),
         partials.binary_partial(binary_artifact = binary_artifact),
@@ -84,10 +88,15 @@ def _macos_application_impl(ctx):
             debug_dependencies = embedded_targets + ctx.attr.additional_contents.keys(),
             debug_outputs_provider = debug_outputs_provider,
         ),
+        # TODO(nglevin): Consider if we need framework_import_partial to communicate a state
+        # before embedded_bundles_partial runs, as currently embedded_bundles_partial tracks
+        # what frameworks have already been declared to be codesigned...
         partials.embedded_bundles_partial(
             bundle_embedded_bundles = True,
             embeddable_targets = embedded_targets,
         ),
+        # TODO(nglevin): WIP. Looking in to adding bits necessary to add provisioning_profile
+        # support (with caching) to this rule.
         partials.framework_import_partial(
             targets = ctx.attr.deps + embedded_targets,
         ),

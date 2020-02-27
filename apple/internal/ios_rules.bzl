@@ -122,10 +122,15 @@ def _ios_application_impl(ctx):
             debug_dependencies = embeddable_targets,
             debug_outputs_provider = binary_target[apple_common.AppleDebugOutputs],
         ),
+        # TODO(nglevin): Consider if we need framework_import_partial to communicate a state
+        # before embedded_bundles_partial runs, as currently embedded_bundles_partial tracks
+        # what frameworks have already been declared to be codesigned...
         partials.embedded_bundles_partial(
             bundle_embedded_bundles = True,
             embeddable_targets = embeddable_targets,
         ),
+        # TODO(nglevin): WIP. Looking in to adding bits necessary to add provisioning_profile
+        # support (with caching) to this rule.
         partials.framework_import_partial(
             targets = ctx.attr.deps + ctx.attr.extensions + ctx.attr.frameworks,
             extra_binaries = [x[AppleBundleInfo].binary for x in ctx.attr.extensions],
@@ -384,10 +389,15 @@ def _ios_imessage_application_impl(ctx):
         ),
         partials.apple_bundle_info_partial(bundle_id = bundle_id),
         partials.binary_partial(binary_artifact = binary_artifact),
+        # TODO(nglevin): Consider if we need framework_import_partial to communicate a state
+        # before embedded_bundles_partial runs, as currently embedded_bundles_partial tracks
+        # what frameworks have already been declared to be codesigned...
         partials.embedded_bundles_partial(
             bundle_embedded_bundles = True,
             embeddable_targets = embeddable_targets,
         ),
+        # TODO(nglevin): WIP. Looking in to adding bits necessary to add provisioning_profile
+        # support (with caching) to this rule.
         partials.framework_import_partial(targets = [ctx.attr.extension]),
         partials.messages_stub_partial(
             binary_artifact = binary_artifact,

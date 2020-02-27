@@ -234,6 +234,11 @@ def _apple_dynamic_framework_import_impl(ctx):
         _all_framework_binaries(framework_groups),
     )
 
+    # TODO(nglevin): WIP. Consider if we need a provisioning_profile attribute to be passed
+    # through, or alternatively if there is another way that we can cache the signing as this rule
+    # is not a top level target like ios_framework can be.
+    #
+    # So far, it is looking like we can make this change without an opt-in switch.
     objc_provider = _objc_provider_with_dependencies(ctx, objc_provider_fields)
     providers.append(objc_provider)
     providers.append(
